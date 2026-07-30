@@ -1,0 +1,14 @@
+# Python / Environment
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# VS Code & IDE settings
+.vscode/
+.idea/
+
+# OS / Misc
+.DS_Store
+*.log
