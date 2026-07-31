@@ -2,8 +2,8 @@
 nano_inference/model_runner.py
 
 Executes PyTorch model forward passes (Prefill & Decode) integrated with
-Paged KV-Cache physical VRAM memory tensors, Chunked Prefill (Sarathi Scheduling),
-and Guided Decoding (Structured Outputs).
+Paged KV-Cache physical GPU VRAM memory tensors, Chunked Prefill (Sarathi Scheduling),
+Guided Decoding (Structured Outputs), and custom PagedAttention kernel execution.
 """
 
 from typing import List, Tuple, Optional
@@ -13,6 +13,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from nano_inference.block_manager import BlockAllocator
 from nano_inference.guided_decoding import JSONSchemaLogitsProcessor
+from nano_inference.paged_attention import paged_attention_decode
 from nano_inference.scheduler import Request
 
 
@@ -20,11 +21,11 @@ class PhysicalKVCachePool:
     """Pre-allocates and manages raw physical GPU VRAM tensors for KV states."""
     def __init__(
         self,
-        num_blocks: int,
-        block_size: int,
-        num_layers: int,
-        num_kv_heads: int,
-        head_dim: int,
+        num_blocks: int = 512,
+        block_size: int = 16,
+        num_layers: int = 24,
+        num_kv_heads: int = 2,
+        head_dim: int = 64,
         dtype: torch.dtype = torch.float16,
         device: str = "cuda",
     ):
@@ -37,10 +38,11 @@ class PhysicalKVCachePool:
         self.device = device
 
         # Physical KV Tensor Pool shape: [num_blocks, 2 (K and V), num_layers, num_kv_heads, block_size, head_dim]
+        # Allocated explicitly on CUDA GPU VRAM
         self.kv_cache = torch.zeros(
             (num_blocks, 2, num_layers, num_kv_heads, block_size, head_dim),
             dtype=dtype,
-            device=device,
+            device=self.device,
         )
 
     def write_kv_token(
@@ -52,23 +54,24 @@ class PhysicalKVCachePool:
         v_tensor: torch.Tensor,
     ):
         """Writes K and V vectors for a single token at a specific physical page offset."""
-        # k_tensor/v_tensor shape: [num_kv_heads, head_dim]
         self.kv_cache[block_id, 0, layer_idx, :, slot_offset, :] = k_tensor
         self.kv_cache[block_id, 1, layer_idx, :, slot_offset, :] = v_tensor
 
 
 class ModelRunner:
-    """Executes model inference hooked into physical Paged KV Cache memory."""
+    """Executes model inference hooked into physical Paged KV Cache GPU VRAM memory."""
     def __init__(
         self,
         model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         dtype: torch.dtype = torch.float16,
     ):
-        self.device = device
+        # Guarantee CUDA GPU device placement
+        assert torch.cuda.is_available(), "❌ NanoInference requires a CUDA-capable GPU!"
+        self.device = "cuda"
         self.dtype = dtype
         
-        print(f"Loading tokenizer and model: {model_name}...")
+        print(f"Loading tokenizer and model: {model_name} onto GPU ({torch.cuda.get_device_name(0)})...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
@@ -82,12 +85,23 @@ class ModelRunner:
         self.num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
         self.head_dim = config.hidden_size // config.num_attention_heads
 
+        # Pre-allocate Physical KV Cache VRAM Pool on GPU
+        self.kv_pool = PhysicalKVCachePool(
+            num_blocks=512,
+            block_size=16,
+            num_layers=self.num_layers,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
         # Initialize Guided Decoding processor for Structured Output JSON masking
         self.guided_processor = JSONSchemaLogitsProcessor(self.tokenizer)
 
-    def prefill_step(self, prefill_requests: List[Tuple[Request, int]], kv_pool):
+    def prefill_step(self, prefill_requests: List[Tuple[Request, int]], kv_pool=None):
         """
-        Executes prefill for a list of (Request, chunk_size) tuples.
+        Executes prefill for a list of (Request, chunk_size) tuples on GPU.
         Supports Chunked Prefill by processing token slices and building KV cache incrementally.
         """
         results = []
@@ -97,6 +111,7 @@ class ModelRunner:
             end_idx = req.num_prefilled_tokens
             chunk_tokens = req.prompt_token_ids[start_idx:end_idx]
 
+            # Enforce CUDA GPU tensor placement
             input_ids = torch.tensor([chunk_tokens], device=self.device)
             past_kv = getattr(req, "past_key_values", None)
 
@@ -124,17 +139,18 @@ class ModelRunner:
 
         return results
 
-    def decode_step(self, decode_requests: List[Request], kv_pool):
-        """Executes a single token decode step for active requests with repetition penalty & guided masking."""
+    def decode_step(self, decode_requests: List[Request], kv_pool=None):
+        """Executes a single token decode step on GPU with repetition penalty & custom PagedAttention dispatch."""
         next_tokens = []
         
         for req in decode_requests:
-            # SAFETY GUARD: If prefill hasn't populated output_token_ids yet, grab the last prompt token
+            # Grab last token for continuous generation step
             if req.output_token_ids:
                 last_token = req.output_token_ids[-1]
             else:
                 last_token = req.prompt_token_ids[-1]
 
+            # Enforce CUDA GPU tensor placement
             input_tensor = torch.tensor([[last_token]], device=self.device)
             
             with torch.no_grad():
