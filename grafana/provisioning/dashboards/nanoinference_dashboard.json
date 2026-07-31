@@ -1,0 +1,104 @@
+{
+    "annotations": {
+        "list": []
+    },
+    "editable": true,
+    "fiscalYearStartMonth": 0,
+    "graphTooltip": 0,
+    "id": null,
+    "links": [],
+    "liveNow": false,
+    "panels": [
+        {
+            "title": "TTFT Latency Distribution (P50 & P99)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 0
+            },
+            "targets": [
+                {
+                    "datasource": "Prometheus",
+                    "expr": "histogram_quantile(0.50, sum(rate(nanoinference_ttft_seconds_bucket[1m])) by (le))",
+                    "legendFormat": "P50 TTFT (s)"
+                },
+                {
+                    "datasource": "Prometheus",
+                    "expr": "histogram_quantile(0.99, sum(rate(nanoinference_ttft_seconds_bucket[1m])) by (le))",
+                    "legendFormat": "P99 TTFT (s)"
+                }
+            ]
+        },
+        {
+            "title": "Prefix Cache Hit Ratio (%)",
+            "type": "stat",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 0
+            },
+            "targets": [
+                {
+                    "datasource": "Prometheus",
+                    "expr": "sum(rate(nanoinference_prefix_cache_hits_total[1m])) / (sum(rate(nanoinference_prefix_cache_hits_total[1m])) + sum(rate(nanoinference_prefix_cache_misses_total[1m]))) * 100",
+                    "legendFormat": "Hit Ratio %"
+                }
+            ]
+        },
+        {
+            "title": "GPU VRAM Block Allocation (%)",
+            "type": "gauge",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 8
+            },
+            "targets": [
+                {
+                    "datasource": "Prometheus",
+                    "expr": "nanoinference_kv_cache_usage_percent",
+                    "legendFormat": "VRAM Usage %"
+                }
+            ]
+        },
+        {
+            "title": "Active Decode Streams vs Prefill Queue Depth",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 8
+            },
+            "targets": [
+                {
+                    "datasource": "Prometheus",
+                    "expr": "nanoinference_requests_running",
+                    "legendFormat": "Active Decode Streams"
+                },
+                {
+                    "datasource": "Prometheus",
+                    "expr": "nanoinference_requests_waiting",
+                    "legendFormat": "Prefill Queue Depth"
+                }
+            ]
+        }
+    ],
+    "refresh": "2s",
+    "schemaVersion": 38,
+    "style": "dark",
+    "tags": [
+        "nanoinference",
+        "llm"
+    ],
+    "time": {
+        "from": "now-15m",
+        "to": "now"
+    },
+    "title": "NanoInference Live Telemetry",
+    "uid": "nanoinference-dashboard"
+}
