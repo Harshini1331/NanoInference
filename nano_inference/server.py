@@ -2,7 +2,7 @@
 OpenAI-Compatible FastAPI Server for NanoInference Engine.
 Includes Server-Sent Events (SSE) token streaming, Automatic Prefix Caching (APC) support,
 Chunked Prefill (Sarathi), Guided Decoding (Structured Outputs), EOS stop-token detection,
-and Prometheus observability.
+Multi-LoRA adapter routing, and Prometheus observability.
 """
 
 import asyncio
@@ -73,6 +73,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = 0.7
     stream: Optional[bool] = True
     response_format: Optional[ResponseFormat] = None  # OpenAI Structured Outputs Schema
+    adapter_id: Optional[str] = None  # Dynamic LoRA adapter routing ID
 
 
 # -----------------------------------------------------------------------------
@@ -87,7 +88,13 @@ async def generate_stream(
     """
     start_time = time.perf_counter()
     first_token_recorded = False
-    eos_token_id = model_runner.tokenizer.eos_token_id
+    
+    tokenizer = model_runner.tokenizer
+    eos_token_id = tokenizer.eos_token_id
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    endoftext_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+    
+    stop_ids = {eos_token_id, im_end_id, endoftext_id}
 
     try:
         while True:
@@ -112,15 +119,18 @@ async def generate_stream(
                     token_id = tokens[req_idx]
 
                     # Convert integer token ID to text string
-                    token_str = model_runner.tokenizer.decode([token_id])
+                    token_str = tokenizer.decode([token_id], skip_special_tokens=False)
 
-                    # Check for EOS or chat stop sequence
-                    is_eos = (token_id == eos_token_id) or ("<|im_end|>" in token_str)
+                    # Check for EOS or chat stop sequences
+                    is_eos = (token_id in stop_ids) or ("<|im_end|>" in token_str) or ("<|endoftext|>" in token_str)
 
                     if is_eos:
                         req.status = RequestStatus.FINISHED
                         yield "data: [DONE]\n\n"
                         break
+
+                    # Clean special tokens for SSE stream output
+                    clean_token_str = tokenizer.decode([token_id], skip_special_tokens=True)
 
                     # Record Time to First Token (TTFT) metric
                     if not first_token_recorded:
@@ -132,20 +142,21 @@ async def generate_stream(
                     TOTAL_TOKENS_GENERATED.inc()
 
                     # Yield OpenAI-formatted SSE payload chunk
-                    chunk = {
-                        "id": f"chatcmpl-{req.request_id}",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": "Qwen/Qwen2.5-0.5B-Instruct",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": token_str},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                    if clean_token_str:
+                        chunk = {
+                            "id": f"chatcmpl-{req.request_id}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": "Qwen/Qwen2.5-0.5B-Instruct",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": clean_token_str},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
 
             # Check if request reaches max_tokens limit or finishes
             if (
@@ -167,12 +178,25 @@ async def generate_stream(
 # -----------------------------------------------------------------------------
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, raw_request: FastAPIRequest):
-    """OpenAI-compatible chat completion endpoint supporting SSE token streaming and Structured Outputs."""
-    # Convert input messages into standard prompt token IDs via model tokenizer
-    prompt_text = body.messages[-1].content
+    """OpenAI-compatible chat completion endpoint supporting SSE token streaming, Chat Templates, and Structured Outputs."""
+    
+    # 1. Format full chat history using tokenizer chat template (<|im_start|>user..., etc.)
+    # Fallback to plain prompt_text string if model tokenizer doesn't have a chat template configured
+    try:
+        messages_dict = [m.model_dump() for m in body.messages]
+        prompt_text = model_runner.tokenizer.apply_chat_template(
+            messages_dict,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:
+        # Fallback for raw text prompts
+        prompt_text = body.messages[-1].content
+
+    # 2. Encode formatted prompt into token IDs
     prompt_token_ids = model_runner.tokenizer.encode(prompt_text)
 
-    # Initialize new request object
+    # 3. Initialize engine request object
     req_id = f"req-{int(time.time() * 1000)}"
     req = EngineRequest(
         request_id=req_id,
@@ -180,11 +204,10 @@ async def chat_completions(body: ChatCompletionRequest, raw_request: FastAPIRequ
         max_tokens=body.max_tokens,
     )
 
-    # Attach response_format attribute for Guided Decoding logit masking if requested
-    if body.response_format:
-        req.response_format = body.response_format.type
-    else:
-        req.response_format = None
+    # 4. Attach optional attributes
+    req.prompt = prompt_text
+    req.response_format = body.response_format.type if body.response_format else None
+    req.adapter_id = body.adapter_id
 
     scheduler.add_request(req)
 

@@ -250,8 +250,15 @@ class ModelRunner:
                 if getattr(req, "response_format", None) == "json_object":
                     logits = self.guided_processor.apply_guided_mask(req, logits)
 
+                # Stop token IDs for Qwen / standard instruct models
+                STOP_TOKEN_IDS = {self.tokenizer.eos_token_id, self.tokenizer.convert_tokens_to_ids("<|im_end|>")}
+                
                 next_token = torch.argmax(logits, dim=-1).item()
-                req.output_token_ids.append(next_token)
+                
+                if next_token in STOP_TOKEN_IDS:
+                    req.is_finished = True
+                else:
+                    req.output_token_ids.append(next_token)
                 next_tokens.append(next_token)
 
         return next_tokens
