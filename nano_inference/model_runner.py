@@ -101,11 +101,16 @@ class ModelRunner:
                 
         return results
 
-    def decode_step(self, decode_requests, kv_pool, repetition_penalty: float = 1.15):
+    def decode_step(self, decode_requests, kv_pool):
         next_tokens = []
         
         for req in decode_requests:
-            last_token = req.output_token_ids[-1]
+            # SAFETY GUARD: If prefill hasn't populated output_token_ids yet, grab the last prompt token
+            if req.output_token_ids:
+                last_token = req.output_token_ids[-1]
+            else:
+                last_token = req.prompt_token_ids[-1]
+
             input_tensor = torch.tensor([[last_token]], device=self.device)
             
             with torch.no_grad():
@@ -119,16 +124,15 @@ class ModelRunner:
                 req.past_key_values = outputs.past_key_values
                 logits = outputs.logits[:, -1, :].clone()
                 
-                # --- APPLY REPETITION PENALTY ---
-                # Combine prompt and generated tokens to penalize duplicates
+                # Apply Repetition Penalty
                 all_tokens = req.prompt_token_ids + req.output_token_ids
                 unique_tokens = set(all_tokens)
                 
                 for token_id in unique_tokens:
                     if logits[0, token_id] < 0:
-                        logits[0, token_id] *= repetition_penalty
+                        logits[0, token_id] *= 1.15
                     else:
-                        logits[0, token_id] /= repetition_penalty
+                        logits[0, token_id] /= 1.15
 
                 next_token = torch.argmax(logits, dim=-1).item()
                 

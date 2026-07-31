@@ -63,6 +63,10 @@ class BlockTable:
         self.block_size: int = block_size
         self.physical_blocks: List[PhysicalTokenBlock] = []
 
+    def add_block(self, block: PhysicalTokenBlock) -> None:
+        """Appends an allocated physical VRAM block to this request's page table."""
+        self.physical_blocks.append(block)
+
     def allocate_slot_for_token(self, token_index: int, allocator: BlockAllocator) -> Optional[PhysicalTokenBlock]:
         """
         Allocates a new physical block when the token index reaches a block boundary.
@@ -70,7 +74,7 @@ class BlockTable:
         """
         if token_index % self.block_size == 0:
             new_block = allocator.allocate()
-            self.physical_blocks.append(new_block)
+            self.add_block(new_block)
             return new_block
         return None
 

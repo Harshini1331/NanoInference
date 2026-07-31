@@ -73,63 +73,56 @@ class Scheduler:
         """Adds a new incoming request to the waiting queue."""
         self.waiting_queue.append(request)
 
-    def schedule(self) -> SchedulerOutputs:
-        """
-        Main scheduling step invoked on every forward pass.
-        Selects requests for prefill/decode based on VRAM capacity & token budget.
-        """
-        scheduled_prefills: List[Tuple[Request, int]] = []
-        scheduled_decodes: List[Request] = []
+    def schedule(self):
+        prefill_requests = []
+        decode_requests = []
         num_batched_tokens = 0
+        BLOCK_SIZE = 16  # Standard block size for PagedAttention
 
-        # 1. Schedule active DECODE requests first to maintain continuous output stream
-        for req in list(self.running_queue):
-            if req.status == RequestStatus.RUNNING:
-                # Determine index for token to be appended in this decode step
-                next_token_index = req.total_token_count
-                
-                # Pre-allocate physical VRAM block if hitting a block boundary
-                if next_token_index % req.block_table.block_size == 0:
-                    if self.allocator.num_free_blocks < 1:
-                        # VRAM full: Preempt or stop scheduling decodes
-                        break
-                    req.block_table.allocate_slot_for_token(next_token_index, self.allocator)
-
-                scheduled_decodes.append(req)
-                num_batched_tokens += 1
-
-        # 2. Schedule WAITING/PREFILL requests into remaining token/slot budget
-        while self.waiting_queue and len(scheduled_decodes) + len(scheduled_prefills) < self.max_num_seqs:
-            req = self.waiting_queue[0]
-            remaining_prompt = len(req.prompt_token_ids) - req.num_prefilled_tokens
-
-            # Calculate chunk size within remaining batched token budget
-            available_token_budget = self.max_num_batched_tokens - num_batched_tokens
-            if available_token_budget <= 0:
+        # 1. Promote waiting requests to prefill
+        while self.waiting_queue:
+            if len(self.running_queue) >= self.max_num_seqs:
                 break
 
-            chunk_size = min(remaining_prompt, available_token_budget)
+            req = self.waiting_queue[0]
+            prompt_len = len(req.prompt_token_ids)
+
+            if num_batched_tokens + prompt_len > self.max_num_batched_tokens:
+                break
+
+            # Calculate how many 16-token physical blocks this prompt needs
+            needed_blocks = (prompt_len + BLOCK_SIZE - 1) // BLOCK_SIZE
             
-            # Allocate blocks for this prompt chunk
-            start_idx = req.num_prefilled_tokens
-            for idx in range(start_idx, start_idx + chunk_size):
-                req.block_table.allocate_slot_for_token(idx, self.allocator)
+            # Check if allocator has enough free blocks available
+            if len(self.allocator.free_blocks) >= needed_blocks:
+                req = self.waiting_queue.pop(0)
+                
+                # Allocate physical blocks for the request
+                for _ in range(needed_blocks):
+                    block = self.allocator.allocate()
+                    req.block_table.add_block(block)
 
-            req.num_prefilled_tokens += chunk_size
-            num_batched_tokens += chunk_size
-            scheduled_prefills.append((req, chunk_size))
-
-            # Move request from waiting to running if prefill is fully chunked
-            if req.is_prefill_complete:
                 req.status = RequestStatus.RUNNING
-                self.running_queue.append(self.waiting_queue.pop(0))
+                self.running_queue.append(req)
+                
+                req.num_prefilled_tokens = prompt_len
+                prefill_requests.append((req, prompt_len))
+                num_batched_tokens += prompt_len
             else:
-                break  # Partial chunk allocated; continue next step
+                # VRAM memory full, wait for active requests to finish
+                break
+
+        # 2. Add running requests ready for decode step
+        for req in self.running_queue:
+            if req not in [pr[0] for pr in prefill_requests]:
+                if num_batched_tokens + 1 <= self.max_num_batched_tokens:
+                    decode_requests.append(req)
+                    num_batched_tokens += 1
 
         return SchedulerOutputs(
-            prefill_requests=scheduled_prefills,
-            decode_requests=scheduled_decodes,
-            num_batched_tokens=num_batched_tokens,
+            prefill_requests=prefill_requests,
+            decode_requests=decode_requests,
+            num_batched_tokens=num_batched_tokens
         )
 
     def free_finished_request(self, req: Request) -> None:

@@ -1,32 +1,76 @@
 """
-nano_inference/server.py
-
-Asynchronous FastAPI Gateway providing an OpenAI-compatible SSE streaming endpoint
-for the NanoInference engine.
+OpenAI-Compatible FastAPI Server for NanoInference Engine.
+Includes Server-Sent Events (SSE) token streaming and Prometheus observability metrics.
 """
 
 import asyncio
 import json
-import uuid
-from typing import List, Optional
-import torch
-from fastapi import FastAPI
+import time
+from typing import AsyncGenerator, List, Optional
+
+from fastapi import FastAPI, Response, Request as FastAPIRequest
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
+
+# Import engine core components
 from nano_inference.block_manager import BlockAllocator
-from nano_inference.scheduler import Request as InferenceRequest, Scheduler
-from nano_inference.model_runner import ModelRunner, PhysicalKVCachePool
+from nano_inference.model_runner import ModelRunner
+from nano_inference.scheduler import Request as EngineRequest, RequestStatus, Scheduler
 
-app = FastAPI(title="NanoInference Serving Engine")
+# Initialize FastAPI App
+app = FastAPI(
+    title="NanoInference Engine API",
+    description="High-performance LLM serving gateway with custom PagedAttention and Continuous Batching",
+    version="1.0.0",
+)
 
-# Global Engine Components
-allocator: Optional[BlockAllocator] = None
-scheduler: Optional[Scheduler] = None
-model_runner: Optional[ModelRunner] = None
-kv_pool: Optional[PhysicalKVCachePool] = None
+# -----------------------------------------------------------------------------
+# Engine Hardware & Core Initialization
+# -----------------------------------------------------------------------------
+# Initialize 512 physical KV blocks (block size = 16 tokens -> 8,192 token capacity)
+allocator = BlockAllocator(total_num_blocks=512, block_size=16)
+scheduler = Scheduler(allocator=allocator, max_num_batched_tokens=2048, max_num_seqs=32)
+model_runner = ModelRunner(model_name="Qwen/Qwen2.5-0.5B-Instruct")
+kv_pool = {}  # Global KV-cache execution tensor pool
 
 
+# -----------------------------------------------------------------------------
+# 📊 Prometheus Telemetry Definitions
+# -----------------------------------------------------------------------------
+KV_CACHE_USAGE = Gauge(
+    "nanoinference_kv_cache_usage_percent",
+    "Percentage of allocated physical KV blocks in GPU VRAM",
+)
+REQUESTS_RUNNING = Gauge(
+    "nanoinference_requests_running",
+    "Number of currently active decode streams",
+)
+REQUESTS_WAITING = Gauge(
+    "nanoinference_requests_waiting",
+    "Number of requests queued in prefill queue",
+)
+TTFT_HISTOGRAM = Histogram(
+    "nanoinference_ttft_seconds",
+    "Time to First Token (TTFT) in seconds",
+    buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+)
+TOTAL_TOKENS_GENERATED = Counter(
+    "nanoinference_tokens_generated_total",
+    "Total output tokens generated across all streams",
+)
+
+
+# -----------------------------------------------------------------------------
+# Pydantic Schemas (OpenAI Spec API)
+# -----------------------------------------------------------------------------
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -35,98 +79,131 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str = "Qwen/Qwen2.5-0.5B-Instruct"
     messages: List[ChatMessage]
-    max_tokens: int = 128
-    stream: bool = True
+    max_tokens: Optional[int] = Field(default=128, ge=1, le=2048)
+    temperature: Optional[float] = 0.7
+    stream: Optional[bool] = True
 
 
-@app.on_event("startup")
-async def startup_event():
-    global allocator, scheduler, model_runner, kv_pool
-    print("🚀 Initializing NanoInference Engine...")
+# -----------------------------------------------------------------------------
+# Engine Streaming Generator
+# -----------------------------------------------------------------------------
+async def generate_stream(
+    req: EngineRequest, raw_request: FastAPIRequest
+) -> AsyncGenerator[str, None]:
+    """
+    Executes continuous batching loop per iteration, yielding SSE token chunks
+    and logging Prometheus metrics.
+    """
+    start_time = time.perf_counter()
+    first_token_recorded = False
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    allocator = BlockAllocator(total_num_blocks=128, block_size=16)
-    scheduler = Scheduler(allocator=allocator, max_num_batched_tokens=2048, max_num_seqs=16)
+    try:
+        while True:
+            # Detect client disconnect to prevent orphan request VRAM block leaks
+            if await raw_request.is_disconnected():
+                scheduler.free_finished_request(req)
+                break
 
-    model_runner = ModelRunner(model_name="Qwen/Qwen2.5-0.5B-Instruct", device=device)
-    kv_pool = PhysicalKVCachePool(
-        num_blocks=128,
-        block_size=16,
-        num_layers=model_runner.num_layers,
-        num_kv_heads=model_runner.num_kv_heads,
-        head_dim=model_runner.head_dim,
-        device=device,
+            outputs = scheduler.schedule()
+
+            # Execute Prefill Phase for newly scheduled requests
+            if outputs.prefill_requests:
+                model_runner.prefill_step(outputs.prefill_requests, kv_pool)
+
+            # Execute Decode Phase for running streams
+            if outputs.decode_requests:
+                tokens = model_runner.decode_step(outputs.decode_requests, kv_pool)
+
+                # Find generated token corresponding to this specific request stream
+                if req in outputs.decode_requests:
+                    req_idx = outputs.decode_requests.index(req)
+                    token_id = tokens[req_idx]
+
+                    # Convert integer token ID to text string
+                    token_str = model_runner.tokenizer.decode([token_id])
+
+                    # Record Time to First Token (TTFT) metric
+                    if not first_token_recorded:
+                        ttft = time.perf_counter() - start_time
+                        TTFT_HISTOGRAM.observe(ttft)
+                        first_token_recorded = True
+
+                    # Increment global output token counter metric
+                    TOTAL_TOKENS_GENERATED.inc()
+
+                    # Yield OpenAI-formatted SSE payload chunk
+                    chunk = {
+                        "id": f"chatcmpl-{req.request_id}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": "Qwen/Qwen2.5-0.5B-Instruct",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": token_str},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+
+            # Check if request reaches max_tokens limit or finishes
+            if (
+                req.status == RequestStatus.FINISHED
+                or len(req.output_token_ids) >= req.max_tokens
+            ):
+                yield "data: [DONE]\n\n"
+                break
+
+            await asyncio.sleep(0.001)  # Yield execution back to event loop
+
+    finally:
+        # Guarantee physical KV memory blocks are freed back to allocator
+        scheduler.free_finished_request(req)
+
+
+# -----------------------------------------------------------------------------
+# Endpoints
+# -----------------------------------------------------------------------------
+@app.post("/v1/chat/completions")
+async def chat_completions(body: ChatCompletionRequest, raw_request: FastAPIRequest):
+    """OpenAI-compatible chat completion endpoint supporting SSE token streaming."""
+    # Convert input messages into standard prompt token IDs via model tokenizer
+    prompt_text = body.messages[-1].content
+    prompt_token_ids = model_runner.tokenizer.encode(prompt_text)
+
+    # Initialize new request object and enqueue into waiting queue
+    req_id = f"req-{int(time.time() * 1000)}"
+    req = EngineRequest(
+        request_id=req_id,
+        prompt_token_ids=prompt_token_ids,
+        max_tokens=body.max_tokens,
     )
-    print("✅ NanoInference Engine Ready!")
-
-
-async def generate_stream(request_id: str, prompt_tokens: list, max_tokens: int):
-    """Asynchronous token generator yielding SSE data chunks cleanly."""
-    req = InferenceRequest(request_id=request_id, prompt_token_ids=prompt_tokens, max_tokens=max_tokens)
-    
     scheduler.add_request(req)
 
-    generated_count = 0
-    eos_token_id = model_runner.tokenizer.eos_token_id
-
-    while generated_count < max_tokens:
-        await asyncio.sleep(0.001)
-
-        outputs = scheduler.schedule()
-
-        # Handle Prefill
-        if outputs.prefill_requests:
-            prefill_tokens = model_runner.prefill_step(outputs.prefill_requests, kv_pool)
-            for r, token_id in zip([pr[0] for pr in outputs.prefill_requests], prefill_tokens):
-                if r.request_id == request_id:
-                    # Append to output_token_ids (matching scheduler.py)
-                    r.output_token_ids.append(token_id)
-                    generated_count += 1
-                    
-                    if token_id == eos_token_id:
-                        generated_count = max_tokens
-                        break
-                    
-                    token_str = model_runner.tokenizer.decode([token_id], skip_special_tokens=True)
-                    yield f"data: {json.dumps({'token': token_str})}\n\n"
-
-        # Handle Decode Steps
-        if outputs.decode_requests:
-            decode_tokens = model_runner.decode_step(outputs.decode_requests, kv_pool)
-            for r, token_id in zip(outputs.decode_requests, decode_tokens):
-                if r.request_id == request_id:
-                    generated_count += 1
-                    
-                    # Stop generation if EOS or stop token hit
-                    if token_id in (model_runner.tokenizer.eos_token_id, 151645): # 151645 is Qwen <|im_end|>
-                        generated_count = max_tokens
-                        break
-                    
-                    token_str = model_runner.tokenizer.decode([token_id], skip_special_tokens=True)
-                    yield f"data: {json.dumps({'token': token_str})}\n\n"
-
-    scheduler.free_finished_request(req)
-    yield "data: [DONE]\n\n"
-
-
-@app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest):
-    request_id = f"req-{uuid.uuid4().hex[:8]}"
-    
-    # Format messages using Qwen's chat template
-    messages = [{"role": m.role, "content": m.content} for m in req.messages]
-    
-    # 1. Generate chat prompt string
-    prompt_str = model_runner.tokenizer.apply_chat_template(
-        messages, 
-        tokenize=False, 
-        add_generation_prompt=True
-    )
-
-    # 2. Explicitly encode to raw integer token IDs list
-    prompt_tokens = model_runner.tokenizer.encode(prompt_str)
-
     return StreamingResponse(
-        generate_stream(request_id=request_id, prompt_tokens=prompt_tokens, max_tokens=req.max_tokens),
-        media_type="text/event-stream",
+        generate_stream(req, raw_request), media_type="text/event-stream"
     )
+
+
+@app.get("/metrics")
+async def get_metrics():
+    """Exposes real-time Prometheus system telemetry and KV-cache metrics."""
+    total_blocks = allocator.total_num_blocks
+    free_blocks = allocator.num_free_blocks
+    allocated_blocks = total_blocks - free_blocks
+
+    # Update dynamic Prometheus system gauges
+    KV_CACHE_USAGE.set(
+        (allocated_blocks / total_blocks) * 100.0 if total_blocks > 0 else 0.0
+    )
+    REQUESTS_RUNNING.set(len(scheduler.running_queue))
+    REQUESTS_WAITING.set(len(scheduler.waiting_queue))
+
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/health")
+async def health_check():
+    """Basic health check endpoint."""
+    return {"status": "healthy", "engine": "NanoInference"}
