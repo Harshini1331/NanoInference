@@ -1,6 +1,7 @@
 """
 OpenAI-Compatible FastAPI Server for NanoInference Engine.
-Includes Server-Sent Events (SSE) token streaming and Prometheus observability metrics.
+Includes Server-Sent Events (SSE) token streaming, Automatic Prefix Caching (APC) support,
+and Prometheus observability metrics.
 """
 
 import asyncio
@@ -12,24 +13,29 @@ from fastapi import FastAPI, Response, Request as FastAPIRequest
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from prometheus_client import (
-    CONTENT_TYPE_LATEST,
-    Counter,
-    Gauge,
-    Histogram,
-    generate_latest,
-)
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 # Import engine core components
 from nano_inference.block_manager import BlockAllocator
 from nano_inference.model_runner import ModelRunner
 from nano_inference.scheduler import Request as EngineRequest, RequestStatus, Scheduler
 
+# Import metrics from dedicated metrics module to prevent circular imports
+from nano_inference.metrics import (
+    KV_CACHE_USAGE,
+    PREFIX_CACHE_HITS,
+    PREFIX_CACHE_MISSES,
+    REQUESTS_RUNNING,
+    REQUESTS_WAITING,
+    TOTAL_TOKENS_GENERATED,
+    TTFT_HISTOGRAM,
+)
+
 # Initialize FastAPI App
 app = FastAPI(
     title="NanoInference Engine API",
-    description="High-performance LLM serving gateway with custom PagedAttention and Continuous Batching",
-    version="1.0.0",
+    description="High-performance LLM serving gateway with custom PagedAttention, Continuous Batching, and Automatic Prefix Caching",
+    version="1.1.0",
 )
 
 # -----------------------------------------------------------------------------
@@ -40,32 +46,6 @@ allocator = BlockAllocator(total_num_blocks=512, block_size=16)
 scheduler = Scheduler(allocator=allocator, max_num_batched_tokens=2048, max_num_seqs=32)
 model_runner = ModelRunner(model_name="Qwen/Qwen2.5-0.5B-Instruct")
 kv_pool = {}  # Global KV-cache execution tensor pool
-
-
-# -----------------------------------------------------------------------------
-# 📊 Prometheus Telemetry Definitions
-# -----------------------------------------------------------------------------
-KV_CACHE_USAGE = Gauge(
-    "nanoinference_kv_cache_usage_percent",
-    "Percentage of allocated physical KV blocks in GPU VRAM",
-)
-REQUESTS_RUNNING = Gauge(
-    "nanoinference_requests_running",
-    "Number of currently active decode streams",
-)
-REQUESTS_WAITING = Gauge(
-    "nanoinference_requests_waiting",
-    "Number of requests queued in prefill queue",
-)
-TTFT_HISTOGRAM = Histogram(
-    "nanoinference_ttft_seconds",
-    "Time to First Token (TTFT) in seconds",
-    buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
-)
-TOTAL_TOKENS_GENERATED = Counter(
-    "nanoinference_tokens_generated_total",
-    "Total output tokens generated across all streams",
-)
 
 
 # -----------------------------------------------------------------------------
@@ -158,7 +138,7 @@ async def generate_stream(
             await asyncio.sleep(0.001)  # Yield execution back to event loop
 
     finally:
-        # Guarantee physical KV memory blocks are freed back to allocator
+        # Guarantee physical KV memory blocks are freed back to allocator or LRU queue
         scheduler.free_finished_request(req)
 
 
@@ -188,7 +168,7 @@ async def chat_completions(body: ChatCompletionRequest, raw_request: FastAPIRequ
 
 @app.get("/metrics")
 async def get_metrics():
-    """Exposes real-time Prometheus system telemetry and KV-cache metrics."""
+    """Exposes real-time Prometheus system telemetry, APC hits, and KV-cache metrics."""
     total_blocks = allocator.total_num_blocks
     free_blocks = allocator.num_free_blocks
     allocated_blocks = total_blocks - free_blocks
