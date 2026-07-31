@@ -1,7 +1,8 @@
 """
 OpenAI-Compatible FastAPI Server for NanoInference Engine.
 Includes Server-Sent Events (SSE) token streaming, Automatic Prefix Caching (APC) support,
-and Prometheus observability metrics.
+Chunked Prefill (Sarathi), Guided Decoding (Structured Outputs), EOS stop-token detection,
+and Prometheus observability.
 """
 
 import asyncio
@@ -34,8 +35,8 @@ from nano_inference.metrics import (
 # Initialize FastAPI App
 app = FastAPI(
     title="NanoInference Engine API",
-    description="High-performance LLM serving gateway with custom PagedAttention, Continuous Batching, and Automatic Prefix Caching",
-    version="1.1.0",
+    description="High-performance LLM serving gateway with custom PagedAttention, Continuous Batching, Automatic Prefix Caching, Chunked Prefill, and Guided Decoding",
+    version="1.2.0",
 )
 
 # -----------------------------------------------------------------------------
@@ -43,7 +44,12 @@ app = FastAPI(
 # -----------------------------------------------------------------------------
 # Initialize 512 physical KV blocks (block size = 16 tokens -> 8,192 token capacity)
 allocator = BlockAllocator(total_num_blocks=512, block_size=16)
-scheduler = Scheduler(allocator=allocator, max_num_batched_tokens=2048, max_num_seqs=32)
+scheduler = Scheduler(
+    allocator=allocator,
+    max_num_batched_tokens=2048,
+    max_num_seqs=32,
+    chunk_size=256,  # Sarathi Chunked Prefill threshold
+)
 model_runner = ModelRunner(model_name="Qwen/Qwen2.5-0.5B-Instruct")
 kv_pool = {}  # Global KV-cache execution tensor pool
 
@@ -56,12 +62,17 @@ class ChatMessage(BaseModel):
     content: str
 
 
+class ResponseFormat(BaseModel):
+    type: str = "json_object"
+
+
 class ChatCompletionRequest(BaseModel):
     model: str = "Qwen/Qwen2.5-0.5B-Instruct"
     messages: List[ChatMessage]
     max_tokens: Optional[int] = Field(default=128, ge=1, le=2048)
     temperature: Optional[float] = 0.7
     stream: Optional[bool] = True
+    response_format: Optional[ResponseFormat] = None  # OpenAI Structured Outputs Schema
 
 
 # -----------------------------------------------------------------------------
@@ -71,11 +82,12 @@ async def generate_stream(
     req: EngineRequest, raw_request: FastAPIRequest
 ) -> AsyncGenerator[str, None]:
     """
-    Executes continuous batching loop per iteration, yielding SSE token chunks
-    and logging Prometheus metrics.
+    Executes continuous batching loop per iteration, yielding SSE token chunks,
+    detecting EOS stop tokens, and logging Prometheus metrics.
     """
     start_time = time.perf_counter()
     first_token_recorded = False
+    eos_token_id = model_runner.tokenizer.eos_token_id
 
     try:
         while True:
@@ -86,7 +98,7 @@ async def generate_stream(
 
             outputs = scheduler.schedule()
 
-            # Execute Prefill Phase for newly scheduled requests
+            # Execute Prefill Phase for newly scheduled requests or chunks
             if outputs.prefill_requests:
                 model_runner.prefill_step(outputs.prefill_requests, kv_pool)
 
@@ -101,6 +113,14 @@ async def generate_stream(
 
                     # Convert integer token ID to text string
                     token_str = model_runner.tokenizer.decode([token_id])
+
+                    # Check for EOS or chat stop sequence
+                    is_eos = (token_id == eos_token_id) or ("<|im_end|>" in token_str)
+
+                    if is_eos:
+                        req.status = RequestStatus.FINISHED
+                        yield "data: [DONE]\n\n"
+                        break
 
                     # Record Time to First Token (TTFT) metric
                     if not first_token_recorded:
@@ -147,18 +167,25 @@ async def generate_stream(
 # -----------------------------------------------------------------------------
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, raw_request: FastAPIRequest):
-    """OpenAI-compatible chat completion endpoint supporting SSE token streaming."""
+    """OpenAI-compatible chat completion endpoint supporting SSE token streaming and Structured Outputs."""
     # Convert input messages into standard prompt token IDs via model tokenizer
     prompt_text = body.messages[-1].content
     prompt_token_ids = model_runner.tokenizer.encode(prompt_text)
 
-    # Initialize new request object and enqueue into waiting queue
+    # Initialize new request object
     req_id = f"req-{int(time.time() * 1000)}"
     req = EngineRequest(
         request_id=req_id,
         prompt_token_ids=prompt_token_ids,
         max_tokens=body.max_tokens,
     )
+
+    # Attach response_format attribute for Guided Decoding logit masking if requested
+    if body.response_format:
+        req.response_format = body.response_format.type
+    else:
+        req.response_format = None
+
     scheduler.add_request(req)
 
     return StreamingResponse(

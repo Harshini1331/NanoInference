@@ -2,14 +2,17 @@
 nano_inference/model_runner.py
 
 Executes PyTorch model forward passes (Prefill & Decode) integrated with
-Paged KV-Cache physical VRAM memory tensors and Chunked Prefill (Sarathi Scheduling).
+Paged KV-Cache physical VRAM memory tensors, Chunked Prefill (Sarathi Scheduling),
+and Guided Decoding (Structured Outputs).
 """
 
 from typing import List, Tuple, Optional
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
 from nano_inference.block_manager import BlockAllocator
+from nano_inference.guided_decoding import JSONSchemaLogitsProcessor
 from nano_inference.scheduler import Request
 
 
@@ -79,6 +82,9 @@ class ModelRunner:
         self.num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
         self.head_dim = config.hidden_size // config.num_attention_heads
 
+        # Initialize Guided Decoding processor for Structured Output JSON masking
+        self.guided_processor = JSONSchemaLogitsProcessor(self.tokenizer)
+
     def prefill_step(self, prefill_requests: List[Tuple[Request, int]], kv_pool):
         """
         Executes prefill for a list of (Request, chunk_size) tuples.
@@ -99,7 +105,7 @@ class ModelRunner:
                     input_ids=input_ids,
                     past_key_values=past_kv,
                     use_cache=True,
-                    return_dict=True
+                    return_dict=True,
                 )
                 
                 # Update HF cache object on request for cumulative prefill state
@@ -108,13 +114,18 @@ class ModelRunner:
                 # If this chunk completes prompt prefill, extract initial decode token
                 if req.is_prefill_complete:
                     logits = outputs.logits[:, -1, :]
+                    
+                    # Apply guided logit mask if request requested structured JSON output
+                    if getattr(req, "response_format", None) == "json_object":
+                        logits = self.guided_processor.apply_guided_mask(req, logits)
+
                     next_token = torch.argmax(logits, dim=-1).item()
                     results.append(next_token)
 
         return results
 
     def decode_step(self, decode_requests: List[Request], kv_pool):
-        """Executes a single token decode step for active requests."""
+        """Executes a single token decode step for active requests with repetition penalty & guided masking."""
         next_tokens = []
         
         for req in decode_requests:
@@ -131,7 +142,7 @@ class ModelRunner:
                     input_ids=input_tensor,
                     past_key_values=req.past_key_values,
                     use_cache=True,
-                    return_dict=True
+                    return_dict=True,
                 )
                 
                 req.past_key_values = outputs.past_key_values
@@ -146,6 +157,10 @@ class ModelRunner:
                         logits[0, token_id] *= 1.15
                     else:
                         logits[0, token_id] /= 1.15
+
+                # Apply Guided Decoding Logit Masking if structured JSON is requested
+                if getattr(req, "response_format", None) == "json_object":
+                    logits = self.guided_processor.apply_guided_mask(req, logits)
 
                 next_token = torch.argmax(logits, dim=-1).item()
                 
