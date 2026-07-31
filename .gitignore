@@ -1,9 +1,33 @@
+# Virtual Environments
 venv/
 .venv/
+env/
+
+# Python Cache & Build Artifacts
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Model Weights & Checkpoints
+*.pt
+*.bin
+*.safetensors
+*.onnx
+models/
+checkpoints/
+
+# System & IDE
 .DS_Store
-*.log
+.vscode/
+.idea/
+
+# Prometheus Data
+data/
+prometheus_data/
