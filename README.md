@@ -1,17 +1,25 @@
 # ⚡ NanoInference
-> **A custom PyTorch LLM serving engine featuring PagedAttention KV-cache management, iteration-level continuous batching, an OpenAI-compatible SSE API gateway, and live Prometheus telemetry.**
+
+A high-throughput LLM serving engine built from scratch in PyTorch, featuring a custom **Triton-accelerated PagedAttention** kernel, **continuous batching**, **dynamic Multi-LoRA adapter switching**, and real-time **Prometheus telemetry**.
+
+Designed to implement systems-level LLM optimizations directly, without high-level wrappers.
 
 ---
 
-## 🎯 Executive Overview
+## 🚀 Key Features & Highlights
 
-**NanoInference** is a low-level, high-throughput LLM inference server designed to implement core systems-level optimizations from scratch. 
-
-Rather than relying on high-level wrappers around Hugging Face or vLLM, NanoInference builds a custom **PagedAttention** engine that maps logical token positions to non-contiguous physical VRAM blocks—eliminating external KV-cache fragmentation. Paired with an **iteration-level continuous scheduler**, the engine dynamically schedules batch execution across heterogeneous prompt lengths without stalling GPU compute loops.
+- **Custom PagedAttention (Triton / PyTorch Fallback)**: Eliminates VRAM fragmentation by mapping logical token sequences to non-contiguous physical block allocations. Implemented via high-performance Triton GPU kernels with PyTorch fallback.
+- **Continuous Batching & Chunked Prefill**: Iteration-level scheduling splits prefill (Sarathi-style chunking) and decode phases to maximize compute efficiency and minimize GPU idle time.
+- **Dynamic Multi-LoRA Serving**: Hot-swaps fine-tuned LoRA adapters (PEFT) on-the-fly at the request level, avoiding redundant base model replication.
+- **Guided Decoding (Structured Output)**: Custom LogitsProcessor enforces structural formats (e.g., JSON Schema/grammar) using logit-bias masking to ensure reliable API completions.
+- **Speculative Decoding**: Accelerates token generation using draft model speculation verified by target model rejection sampling.
+- **Engine-Level Quantization**: Out-of-the-box support for FP8 linear weights, as well as INT8 and INT4 (via `bitsandbytes`) quantization to optimize VRAM footprints.
+- **Asynchronous FastAPI Gateway**: OpenAI-compatible endpoint (`/v1/chat/completions`) utilizing Server-Sent Events (SSE) for streaming. Features instant block reclamation on client disconnects to prevent memory leaks.
+- **Prometheus Telemetry & Playground**: Exposes metrics (TTFT, inter-token latency, block utilization) natively for Grafana dashboarding. Includes a Gradio 5+ playground UI.
 
 ---
 
-## 🏛 System Architecture & Request Lifecycle
+## 🏛 System Architecture & Lifecycle
 
 ```text
                                ┌──────────────────────────────────────────────┐
@@ -45,119 +53,54 @@ Rather than relying on high-level wrappers around Hugging Face or vLLM, NanoInfe
 
 ---
 
-## 📊 System Benchmarks
-
-Evaluated on an NVIDIA RTX 5070 GPU running concurrent requests against `Qwen/Qwen2.5-0.5B-Instruct`:
-
-| Metric | Measured Value | Architectural Significance |
-| :--- | :--- | :--- |
-| **Concurrency Level** | 5 active streams | Evaluates continuous batching under multi-user contention |
-| **Request Success Rate** | 100% (10/10 completed) | Zero block leaks or VRAM out-of-memory errors |
-| **P50 TTFT (Time-To-First-Token)** | 1,592 ms | Latency for initial prefill pass and page table entry creation |
-| **P95 TTFT** | 2,470 ms | Tail latency ceiling under parallel prefill scheduling |
-| **Average ITL (Inter-Token Latency)** | 1,182 ms/token | Time per decoding iteration step across concurrent streams |
-| **Engine Throughput** | 4.20 tokens/sec | Execution speed in eager-mode PyTorch continuous generation |
-
----
-
-## 🛠 Core Systems Implementation
-
-### 1. PagedAttention Memory Management (`nano_inference/block_manager.py`)
-* **Virtual Page Tables:** Implements OS-style virtual memory page mapping (`BlockTable`) to decouple a sequence's logical token indices from physical non-contiguous GPU VRAM memory space.
-* **Fixed Block Allocator:** Allocates memory in fixed 16-token physical blocks (`PhysicalTokenBlock`), preventing external memory fragmentation and limiting internal fragmentation to $< 16$ tokens per sequence.
-* **Block Recycling:** Tracks reference counts per block to handle dynamic request creation, prompt prefix caching, and deterministic deallocation upon stream completion.
-
-### 2. Iteration-Level Continuous Batcher (`nano_inference/scheduler.py`)
-* **Prefill & Decode Decoupling:** Dynamically batches incoming sequences in prefill phase (processing prompt context) alongside active decode phases (generating next-token outputs) in a single unified execution step.
-* **Dynamic Concurrency Control:** Prevents out-of-memory crashes by capping maximum batched tokens and enforcing physical block capacity limits before moving requests from `WAITING` to `RUNNING` status.
-
-### 3. OpenAI Gateway & SSE Streaming (`nano_inference/server.py`)
-* **OpenAI-Compatible Streaming:** Implements SSE protocol emitting `chat.completion.chunk` payloads compatible with native OpenAI client libraries.
-* **Orphan Request Reclamation:** Listens for client HTTP dropouts (`request.is_disconnected()`) to instantly free allocated page blocks back to the memory pool, preventing memory leaks during unexpected network failures.
-
-### 4. Telemetry & Observability (`/metrics`)
-Exposes live Prometheus indicators:
-* `nanoinference_kv_cache_usage_percent`: Real-time percentage of physical VRAM blocks consumed.
-* `nanoinference_requests_running`: Gauge for active decode loops.
-* `nanoinference_requests_waiting`: Queue depth indicator for prefill scheduling.
-* `nanoinference_ttft_seconds`: Histogram tracking Time-To-First-Token latencies.
-* `nanoinference_tokens_generated_total`: Total output token generation counter.
-
----
-
 ## 📂 Project Structure
 
-```text
-NanoInference/
-├── nano_inference/
-│   ├── block_manager.py     # PagedAttention page tables & physical VRAM block allocator
-│   ├── scheduler.py         # Continuous batching iteration-level scheduler
-│   ├── model_runner.py       # Model prefill & decode execution passes
-│   └── server.py            # FastAPI gateway, SSE streaming & Prometheus metrics
-├── platform/
-│   └── benchmarks/
-│       └── benchmark_serving.py  # Asynchronous multi-stream benchmarking suite
-├── deploy/
-│   ├── Dockerfile           # Multi-stage CUDA runtime container spec
-│   └── k8s-deployment.yaml  # Kubernetes Deployment & Service manifests with GPU limits
-├── requirements.txt         # Dependencies
-└── README.md
-```
+- **`nano_inference/`**
+  - **`block_manager.py`**: OS-style virtual page table allocator for dynamic VRAM block tracking.
+  - **`paged_attention.py`**: Triton GPU kernel-accelerated decode attention layer with PyTorch reference fallback.
+  - **`scheduler.py`**: Iteration-level continuous batcher and Sarathi-style chunked prefill scheduler.
+  - **`model_runner.py`**: Prefill/decode execution, dynamic PEFT LoRA adapter routing, and quantization managers.
+  - **`guided_decoding.py`**: Logits processor enforcing JSON schema structures.
+  - **`speculative.py`**: Draft-target token verification engine for speculative sampling.
+  - **`metrics.py`**: Custom Prometheus instrumentation (TTFT, throughput, cache utilization).
+  - **`server.py`**: FastAPI server hosting SSE streaming and orphan-request VRAM reclamation.
+- **`benchmarks/`**: Offline execution throughput testing.
+- **`platform/benchmarks/`**: Asynchronous concurrent client-serving load testing.
+- **`deploy/`**: Multi-stage CUDA Dockerfile & Kubernetes GPU deployment manifests.
+- **`ui.py`**: Gradio-powered developer playground.
 
 ---
 
-## 🚀 Quickstart
+## ⚡ Quickstart
 
-### Local Setup
-
+### 1. Setup Environment
 ```bash
-# Clone the repository
-git clone https://github.com/your-username/NanoInference.git
-cd NanoInference
-
-# Initialize environment
 python -m venv venv
-source venv/bin/activate  # On Windows PowerShell: .\venv\Scripts\Activate.ps1
-
-# Install requirements
+source venv/bin/activate  # Windows: .\venv\Scripts\activate
 pip install -r requirements.txt
+```
 
-# Start engine server
+### 2. Start the Server
+```bash
 uvicorn nano_inference.server:app --host 0.0.0.0 --port 8000
 ```
 
-### Run Benchmarks
-
-In a second terminal, execute the async load suite:
-
+### 3. Launch the Playground UI
 ```bash
-python platform/benchmarks/benchmark_serving.py --concurrency 5 --requests 10 --max-tokens 64
+python ui.py
 ```
 
-### Inspect Prometheus Metrics
-
+### 4. Run Load Benchmarks
 ```bash
-curl http://127.0.0.1:8000/metrics
+python platform/benchmarks/benchmark_serving.py --concurrency 5 --requests 10 --max-tokens 64
 ```
 
 ---
 
 ## 🐳 Containerized Deployment
 
-### Build Container
-
+### Build & Run Docker Container
 ```bash
-docker build -f deploy/Dockerfile -t nanoinference:v1 .
-```
-
-### Run Container with GPU Access
-
-```bash
-docker run --gpus all -p 8000:8000 nanoinference:v1
-```
-
-### Test Inference Stream via Container
-
-```bash
-python -c "import requests; r = requests.post('http://127.0.0.1:8000/v1/chat/completions', json={'messages': [{'role': 'user', 'content': 'Explain continuous batching in one sentence.'}], 'max_tokens': 32}, stream=True); [print(line.decode('utf-8')) for line in r.iter_lines() if line]"
+docker build -f deploy/Dockerfile -t nanoinference:latest .
+docker run --gpus all -p 8000:8000 nanoinference:latest
 ```
