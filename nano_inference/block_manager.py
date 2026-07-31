@@ -113,9 +113,9 @@ class BlockTable:
         self.physical_blocks.append(block)
 
     @staticmethod
-    def compute_block_hash(token_chunk: List[int], parent_hash: Optional[int] = None) -> int:
-        """Computes a deterministic content hash for a 16-token block given its prefix history."""
-        return hash((parent_hash, tuple(token_chunk)))
+    def compute_block_hash(token_prefix: Tuple[int, ...]) -> int:
+        """Computes a deterministic content hash for exact sequence prefix tokens."""
+        return hash(token_prefix)
 
     def allocate_slot_for_token(
         self, 
@@ -124,16 +124,19 @@ class BlockTable:
         allocator: BlockAllocator
     ) -> Tuple[Optional[PhysicalTokenBlock], bool]:
         """
-        Allocates a physical block on block boundaries (0, 16, 32...).
-        Computes block prefix hash and attempts cache hit in BlockAllocator.
-        Returns: (allocated_block, is_cache_hit)
+        Allocates a physical block on 16-token boundaries (0, 16, 32...).
+        Computes block prefix hash based on cumulative token prefix up to current block.
         """
         if token_index % self.block_size == 0:
-            chunk = tokens[token_index : token_index + self.block_size]
+            block_end = min(token_index + self.block_size, len(tokens))
+            chunk = tokens[token_index : block_end]
             
-            # Compute cumulative hash linked to previous block's hash
-            parent_hash = self.physical_blocks[-1].hash if self.physical_blocks else None
-            block_hash = self.compute_block_hash(chunk, parent_hash) if len(chunk) == self.block_size else None
+            if chunk:
+                # Hash cumulative prefix tokens up to this block boundary
+                cumulative_prefix = tuple(tokens[:block_end])
+                block_hash = self.compute_block_hash(cumulative_prefix)
+            else:
+                block_hash = None
             
             new_block, is_hit = allocator.allocate(block_hash=block_hash)
             self.add_block(new_block)
