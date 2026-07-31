@@ -1,14 +1,15 @@
 """
 nano_inference/scheduler.py
 
-Implements Iteration-Level Continuous Batching, Automatic Prefix Caching (APC),
-and Dynamic Request Queue Management.
+Implements Iteration-Level Continuous Batching, Chunked Prefill (Sarathi Scheduling),
+and Automatic Prefix Caching (APC).
 """
 
 from enum import Enum
 from typing import List, Optional, Tuple
 from nano_inference.block_manager import BlockAllocator, BlockTable
 from nano_inference.metrics import PREFIX_CACHE_HITS, PREFIX_CACHE_MISSES
+
 
 class RequestStatus(Enum):
     WAITING = "WAITING"
@@ -27,7 +28,7 @@ class Request:
         
         self.status: RequestStatus = RequestStatus.WAITING
         self.block_table: BlockTable = BlockTable()
-        self.num_prefilled_tokens: int = 0  # For Chunked Prefill tracking
+        self.num_prefilled_tokens: int = 0  # Tracks processed prompt tokens for Chunked Prefill
 
     @property
     def total_token_count(self) -> int:
@@ -37,12 +38,16 @@ class Request:
     def is_prefill_complete(self) -> bool:
         return self.num_prefilled_tokens >= len(self.prompt_token_ids)
 
+    @property
+    def remaining_prefill_tokens(self) -> int:
+        return max(0, len(self.prompt_token_ids) - self.num_prefilled_tokens)
+
 
 class SchedulerOutputs:
     """Encapsulates scheduled requests for a single forward pass iteration."""
     def __init__(
         self,
-        prefill_requests: List[Tuple[Request, int]],  # (Request, chunk_size)
+        prefill_requests: List[Tuple[Request, int]],  # List of (Request, chunk_size)
         decode_requests: List[Request],
         num_batched_tokens: int,
     ):
@@ -53,18 +58,20 @@ class SchedulerOutputs:
 
 class Scheduler:
     """
-    Iteration-level Continuous Batching Scheduler with Automatic Prefix Caching.
-    Max 2,048 total tokens and max 32 concurrent requests per step/iteration.
+    Iteration-level Continuous Batching Scheduler with Chunked Prefill (Sarathi)
+    and Automatic Prefix Caching (APC).
     """
     def __init__(
         self,
         allocator: BlockAllocator,
         max_num_batched_tokens: int = 2048,
         max_num_seqs: int = 32,
+        chunk_size: int = 256,  # Max tokens per prefill chunk pass
     ):
         self.allocator: BlockAllocator = allocator
         self.max_num_batched_tokens: int = max_num_batched_tokens
         self.max_num_seqs: int = max_num_seqs
+        self.chunk_size: int = chunk_size
 
         self.waiting_queue: List[Request] = []
         self.running_queue: List[Request] = []
@@ -73,32 +80,36 @@ class Scheduler:
         """Adds a new incoming request to the waiting queue."""
         self.waiting_queue.append(request)
 
-    def schedule(self):
+    def schedule(self) -> SchedulerOutputs:
         prefill_requests = []
         decode_requests = []
         num_batched_tokens = 0
         BLOCK_SIZE = 16  # Standard block size for PagedAttention
 
-        # 1. Promote waiting requests to prefill with Automatic Prefix Caching
+        # 1. Schedule Chunked Prefill requests
         while self.waiting_queue:
             if len(self.running_queue) >= self.max_num_seqs:
                 break
 
             req = self.waiting_queue[0]
-            prompt_len = len(req.prompt_token_ids)
+            remaining = req.remaining_prefill_tokens
 
-            if num_batched_tokens + prompt_len > self.max_num_batched_tokens:
+            # Cap chunk size to remaining prefill tokens and max_num_batched_tokens limit
+            current_chunk = min(remaining, self.chunk_size)
+            if num_batched_tokens + current_chunk > self.max_num_batched_tokens:
                 break
 
-            # Calculate how many 16-token physical blocks this prompt needs
-            needed_blocks = (prompt_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+            # Calculate physical 16-token blocks needed for this chunk
+            start_token_idx = req.num_prefilled_tokens
+            end_token_idx = start_token_idx + current_chunk
+            needed_blocks = (end_token_idx + BLOCK_SIZE - 1) // BLOCK_SIZE - len(req.block_table.physical_blocks)
 
-            # Check if allocator has enough free blocks available
+            # Allocate blocks if memory available
             if len(self.allocator.free_blocks) >= needed_blocks:
                 req = self.waiting_queue.pop(0)
 
-                # Allocate/reuse physical blocks using content hashing & APC
-                for idx in range(0, prompt_len, BLOCK_SIZE):
+                # Allocate/reuse physical blocks using content hashing & APC for this chunk
+                for idx in range(start_token_idx, end_token_idx, BLOCK_SIZE):
                     block, is_hit = req.block_table.allocate_slot_for_token(
                         token_index=idx,
                         tokens=req.prompt_token_ids,
@@ -110,21 +121,26 @@ class Scheduler:
                         else:
                             PREFIX_CACHE_MISSES.inc()
 
-                req.status = RequestStatus.RUNNING
-                self.running_queue.append(req)
+                req.num_prefilled_tokens += current_chunk
+                prefill_requests.append((req, current_chunk))
+                num_batched_tokens += current_chunk
 
-                req.num_prefilled_tokens = prompt_len
-                prefill_requests.append((req, prompt_len))
-                num_batched_tokens += prompt_len
+                # If prefill is incomplete, keep in waiting_queue at front for next iteration;
+                # otherwise promote to running_queue for decode
+                if not req.is_prefill_complete:
+                    self.waiting_queue.insert(0, req)
+                else:
+                    req.status = RequestStatus.RUNNING
+                    self.running_queue.append(req)
             else:
-                # VRAM memory full, wait for active requests to finish
+                # VRAM full, wait for active requests to finish
                 break
 
-        # 2. Add running requests ready for decode step
+        # 2. Schedule running decode requests
         for req in self.running_queue:
             if req not in [pr[0] for pr in prefill_requests]:
                 if num_batched_tokens + 1 <= self.max_num_batched_tokens:
-                    # Check if next generated decode token requires a new physical block
+                    # Allocate block boundary expansion for next decode token if needed
                     current_tokens = req.prompt_token_ids + req.output_token_ids
                     next_token_idx = len(current_tokens)
                     
@@ -154,3 +170,5 @@ class Scheduler:
         req.block_table.free_all(self.allocator)
         if req in self.running_queue:
             self.running_queue.remove(req)
+        if req in self.waiting_queue:
+            self.waiting_queue.remove(req)

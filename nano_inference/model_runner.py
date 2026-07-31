@@ -2,7 +2,7 @@
 nano_inference/model_runner.py
 
 Executes PyTorch model forward passes (Prefill & Decode) integrated with
-Paged KV-Cache physical VRAM memory tensors.
+Paged KV-Cache physical VRAM memory tensors and Chunked Prefill (Sarathi Scheduling).
 """
 
 from typing import List, Tuple, Optional
@@ -79,29 +79,42 @@ class ModelRunner:
         self.num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
         self.head_dim = config.hidden_size // config.num_attention_heads
 
-    def prefill_step(self, prefill_requests, kv_pool):
+    def prefill_step(self, prefill_requests: List[Tuple[Request, int]], kv_pool):
+        """
+        Executes prefill for a list of (Request, chunk_size) tuples.
+        Supports Chunked Prefill by processing token slices and building KV cache incrementally.
+        """
         results = []
-        for req, block_table in prefill_requests:
-            input_ids = torch.tensor([req.prompt_token_ids], device=self.device)
-            
+        for req, chunk_size in prefill_requests:
+            # Determine starting offset for this chunk
+            start_idx = req.num_prefilled_tokens - chunk_size
+            end_idx = req.num_prefilled_tokens
+            chunk_tokens = req.prompt_token_ids[start_idx:end_idx]
+
+            input_ids = torch.tensor([chunk_tokens], device=self.device)
+            past_kv = getattr(req, "past_key_values", None)
+
             with torch.no_grad():
                 outputs = self.model(
                     input_ids=input_ids,
+                    past_key_values=past_kv,
                     use_cache=True,
                     return_dict=True
                 )
                 
-                # Store HF cache object directly on the request
+                # Update HF cache object on request for cumulative prefill state
                 req.past_key_values = outputs.past_key_values
                 
-                logits = outputs.logits[:, -1, :]
-                next_token = torch.argmax(logits, dim=-1).item()
-                
-                results.append(next_token)
-                
+                # If this chunk completes prompt prefill, extract initial decode token
+                if req.is_prefill_complete:
+                    logits = outputs.logits[:, -1, :]
+                    next_token = torch.argmax(logits, dim=-1).item()
+                    results.append(next_token)
+
         return results
 
-    def decode_step(self, decode_requests, kv_pool):
+    def decode_step(self, decode_requests: List[Request], kv_pool):
+        """Executes a single token decode step for active requests."""
         next_tokens = []
         
         for req in decode_requests:
