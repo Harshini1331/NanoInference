@@ -15,6 +15,7 @@ from nano_inference.block_manager import BlockAllocator
 from nano_inference.guided_decoding import JSONSchemaLogitsProcessor
 from nano_inference.paged_attention import paged_attention_decode
 from nano_inference.scheduler import Request
+from nano_inference.speculative import SpeculativeEngine
 
 
 class PhysicalKVCachePool:
@@ -36,6 +37,7 @@ class PhysicalKVCachePool:
         self.head_dim = head_dim
         self.dtype = dtype
         self.device = device
+        self.speculative_engine = SpeculativeEngine(k_speculative_tokens=3)
 
         # Physical KV Tensor Pool shape: [num_blocks, 2 (K and V), num_layers, num_kv_heads, block_size, head_dim]
         # Allocated explicitly on CUDA GPU VRAM
@@ -184,3 +186,51 @@ class ModelRunner:
                 next_tokens.append(next_token)
                 
         return next_tokens
+
+    def speculative_decode_step(self, req: Request) -> List[int]:
+        """
+        Executes a Speculative Decoding pass:
+        1. Draft model generates K candidate tokens fast.
+        2. Target model verifies K candidates in 1 parallel forward pass.
+        """
+        # Step 1: Generate K draft tokens
+        draft_tokens = []
+        curr_past_kv = req.past_key_values
+        last_token = req.output_token_ids[-1] if req.output_token_ids else req.prompt_token_ids[-1]
+        
+        for _ in range(self.speculative_engine.k):
+            input_tensor = torch.tensor([[last_token]], device=self.device)
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids=input_tensor,
+                    past_key_values=curr_past_kv,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                curr_past_kv = outputs.past_key_values
+                next_tok = torch.argmax(outputs.logits[:, -1, :], dim=-1).item()
+                draft_tokens.append(next_tok)
+                last_token = next_tok
+
+        # Step 2: Verify candidate slice in 1 parallel target forward pass
+        candidate_tensor = torch.tensor([draft_tokens], device=self.device)
+        with torch.no_grad():
+            target_outputs = self.model(
+                input_ids=candidate_tensor,
+                past_key_values=req.past_key_values,  # Verification against un-drafted KV state
+                use_cache=True,
+                return_dict=True,
+            )
+
+        # Step 3: Accept / Reject candidates
+        accepted_tokens = self.speculative_engine.verify_and_accept(
+            draft_tokens=draft_tokens,
+            target_logits=target_outputs.logits,
+        )
+
+        # Update official past_key_values and output tokens
+        req.past_key_values = target_outputs.past_key_values
+        req.output_token_ids.extend(accepted_tokens)
+
+        return accepted_tokens
+        
