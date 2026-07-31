@@ -20,15 +20,27 @@ class RequestStatus(Enum):
 
 class Request:
     """Represents an incoming user LLM generation request."""
-    def __init__(self, request_id: str, prompt_token_ids: List[int], max_tokens: int = 128):
+    def __init__(
+        self,
+        request_id: str,
+        prompt_token_ids: List[int],
+        prompt: str = "",
+        max_tokens: int = 128,
+        response_format: Optional[str] = None,
+        adapter_id: Optional[str] = None,
+    ):
         self.request_id: str = request_id
+        self.prompt: str = prompt
         self.prompt_token_ids: List[int] = prompt_token_ids
-        self.output_token_ids: List[int] = []
         self.max_tokens: int = max_tokens
-        
+        self.response_format: Optional[str] = response_format
+        self.adapter_id: Optional[str] = adapter_id
+
+        self.output_token_ids: List[int] = []
         self.status: RequestStatus = RequestStatus.WAITING
         self.block_table: BlockTable = BlockTable()
         self.num_prefilled_tokens: int = 0  # Tracks processed prompt tokens for Chunked Prefill
+        self.past_key_values = None
 
     @property
     def total_token_count(self) -> int:
