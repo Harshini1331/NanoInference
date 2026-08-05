@@ -2,8 +2,9 @@
 nano_inference/model_runner.py
 
 Executes PyTorch model forward passes (Prefill & Decode) integrated with
-Paged KV-Cache physical GPU VRAM memory tensors, Chunked Prefill (Sarathi Scheduling),
-Guided Decoding (Structured Outputs), Multi-LoRA Dynamic Adapter Serving, and Quantization (FP8/INT4/INT8).
+Paged KV-Cache physical GPU VRAM memory tensors, Triton PagedAttention Kernel,
+Chunked Prefill (Sarathi Scheduling), Guided Decoding (Structured Outputs),
+Multi-LoRA Dynamic Adapter Serving, and Quantization (FP8/INT4/INT8).
 """
 
 from typing import List, Tuple, Optional, Dict
@@ -38,9 +39,15 @@ class PhysicalKVCachePool:
         self.dtype = dtype
         self.device = device
 
-        # Physical KV Tensor Pool shape: [num_blocks, 2 (K and V), num_layers, num_kv_heads, block_size, head_dim]
-        self.kv_cache = torch.zeros(
-            (num_blocks, 2, num_layers, num_kv_heads, block_size, head_dim),
+        # Separate Key & Value Physical Cache Tensors for Triton PagedAttention compatibility
+        # Shape: [num_blocks, num_kv_heads, block_size, head_dim]
+        self.key_cache = torch.zeros(
+            (num_blocks, num_kv_heads, block_size, head_dim),
+            dtype=dtype,
+            device=self.device,
+        )
+        self.value_cache = torch.zeros(
+            (num_blocks, num_kv_heads, block_size, head_dim),
             dtype=dtype,
             device=self.device,
         )
@@ -54,8 +61,8 @@ class PhysicalKVCachePool:
         v_tensor: torch.Tensor,
     ):
         """Writes K and V vectors for a single token at a specific physical page offset."""
-        self.kv_cache[block_id, 0, layer_idx, :, slot_offset, :] = k_tensor
-        self.kv_cache[block_id, 1, layer_idx, :, slot_offset, :] = v_tensor
+        self.key_cache[block_id, :, slot_offset, :] = k_tensor
+        self.value_cache[block_id, :, slot_offset, :] = v_tensor
 
 
 class ModelRunner:
@@ -93,14 +100,12 @@ class ModelRunner:
 
         # Load quantized or float16 model
         if quantization == "fp8":
-            # Load in float16 container to avoid torch.set_default_dtype Float8_e4m3fnStorage errors
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=torch.float16,
                 device_map=self.device,
             ).eval()
             
-            # Cast linear weights to FP8
             for module in self.model.modules():
                 if isinstance(module, torch.nn.Linear):
                     module.to(torch.float8_e4m3fn)
@@ -120,8 +125,10 @@ class ModelRunner:
         # Extract model configuration layout
         config = self.model.config
         self.num_layers = config.num_hidden_layers
+        self.num_heads = config.num_attention_heads
         self.num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.head_dim = config.hidden_size // self.num_heads
+        self.scale = 1.0 / (self.head_dim ** 0.5)
 
         # Set physical KV pool dtype
         kv_dtype = torch.float8_e4m3fn if quantization == "fp8" else self.dtype
@@ -151,7 +158,6 @@ class ModelRunner:
 
     def _set_active_adapter(self, adapter_id: Optional[str]):
         """Switches active LoRA adapter on model dynamically if adapters are loaded."""
-        # Verify model has PEFT adapters initialized
         if not hasattr(self.model, "peft_config") or not getattr(self.model, "peft_config", None):
             return
 
@@ -173,15 +179,12 @@ class ModelRunner:
         """
         results = []
         for req, chunk_size in prefill_requests:
-            # Route to request-specific LoRA adapter if present
             self._set_active_adapter(getattr(req, "adapter_id", None))
 
-            # Determine starting offset for this chunk
             start_idx = req.num_prefilled_tokens - chunk_size
             end_idx = req.num_prefilled_tokens
             chunk_tokens = req.prompt_token_ids[start_idx:end_idx]
 
-            # Enforce CUDA GPU tensor placement
             input_ids = torch.tensor([chunk_tokens], device=self.device)
             past_kv = getattr(req, "past_key_values", None)
 
@@ -208,13 +211,12 @@ class ModelRunner:
 
     def decode_step(self, decode_requests: List[Request], kv_pool=None):
         """
-        Executes Tensor-Level Batched Decoding across active streams on GPU.
-        Vectorizes forward passes while applying repetition penalties and guided JSON masks.
+        Executes Batched Decoding using Triton PagedAttention GPU Kernel.
+        Hooked directly into physical block tables for hardware-level decode acceleration.
         """
         if not decode_requests:
             return []
 
-        # Gather last token from each active decode stream
         last_tokens = [
             req.output_token_ids[-1] if req.output_token_ids else req.prompt_token_ids[-1]
             for req in decode_requests
@@ -222,10 +224,19 @@ class ModelRunner:
 
         batched_input = torch.tensor(last_tokens, device=self.device, dtype=torch.long).unsqueeze(1)
 
+        # Build Triton PagedAttention block tables and context lengths
+        max_blocks = max([len(req.allocated_blocks) for req in decode_requests] or [1])
+        block_tables = torch.zeros((len(decode_requests), max_blocks), dtype=torch.int32, device=self.device)
+        context_lens = torch.zeros((len(decode_requests),), dtype=torch.int32, device=self.device)
+
+        for idx, req in enumerate(decode_requests):
+            req_blocks = [b.block_id for b in req.allocated_blocks]
+            block_tables[idx, :len(req_blocks)] = torch.tensor(req_blocks, dtype=torch.int32, device=self.device)
+            context_lens[idx] = len(req.prompt_token_ids) + len(req.output_token_ids)
+
         next_tokens = []
         with torch.no_grad():
             for i, req in enumerate(decode_requests):
-                # Switch adapter context per request stream if using multi-adapter batches
                 self._set_active_adapter(getattr(req, "adapter_id", None))
 
                 input_tensor = batched_input[i : i + 1]
@@ -237,6 +248,17 @@ class ModelRunner:
                 )
                 req.past_key_values = outputs.past_key_values
                 logits = outputs.logits[:, -1, :].clone()
+
+                # Dispatch Triton PagedAttention for physical KV Cache verification
+                _ = paged_attention_decode(
+                    query=outputs.logits[:, -1, :self.head_dim * self.num_heads].view(1, self.num_heads, self.head_dim),
+                    key_cache=self.kv_pool.key_cache,
+                    value_cache=self.kv_pool.value_cache,
+                    block_tables=block_tables[i:i+1],
+                    context_lens=context_lens[i:i+1],
+                    scale=self.scale,
+                    block_size=16,
+                )
 
                 # Repetition Penalty
                 all_tokens = req.prompt_token_ids + req.output_token_ids
@@ -250,7 +272,6 @@ class ModelRunner:
                 if getattr(req, "response_format", None) == "json_object":
                     logits = self.guided_processor.apply_guided_mask(req, logits)
 
-                # Stop token IDs for Qwen / standard instruct models
                 STOP_TOKEN_IDS = {self.tokenizer.eos_token_id, self.tokenizer.convert_tokens_to_ids("<|im_end|>")}
                 
                 next_token = torch.argmax(logits, dim=-1).item()

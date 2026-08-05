@@ -1,8 +1,8 @@
 """
 nano_inference/paged_attention.py
 
-Custom PagedAttention implementation with Triton GPU kernel acceleration
-and PyTorch reference fallback.
+Production-grade PagedAttention decode kernel using Triton GPU acceleration
+with online Softmax and vectorized memory loading, with PyTorch reference fallback.
 """
 
 import torch
@@ -18,10 +18,15 @@ except ImportError:
 
 
 if TRITON_AVAILABLE:
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_SIZE': 16}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_SIZE': 16}, num_warps=8, num_stages=4),
+        ],
+        key=['head_dim']
+    )
     @triton.jit
     def _paged_attention_decode_kernel(
-        exp_sums_ptr,
-        max_scores_ptr,
         out_ptr,
         query_ptr,
         key_cache_ptr,
@@ -32,8 +37,7 @@ if TRITON_AVAILABLE:
         num_seqs,
         num_heads,
         head_dim: tl.constexpr,
-        block_size: tl.constexpr,
-        max_num_blocks_per_seq: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,  # Autotuned symbol
         stride_q_seq,
         stride_q_head,
         stride_k_block,
@@ -46,7 +50,6 @@ if TRITON_AVAILABLE:
         stride_out_head,
         stride_bt_seq,
     ):
-        """Triton kernel for single-query token decode attention using Paged KV Cache."""
         seq_idx = tl.program_id(0)
         head_idx = tl.program_id(1)
 
@@ -54,60 +57,74 @@ if TRITON_AVAILABLE:
             return
 
         context_len = tl.load(context_lens_ptr + seq_idx)
-        num_blocks = (context_len + block_size - 1) // block_size
+        num_blocks = (context_len + BLOCK_SIZE - 1) // BLOCK_SIZE
 
         dim_offsets = tl.arange(0, head_dim)
+        
+        # Load Query vector [1, head_dim]
         q_ptr = query_ptr + seq_idx * stride_q_seq + head_idx * stride_q_head + dim_offsets
         q = tl.load(q_ptr)
 
-        max_score = -float("inf")
+        # Accumulators for Online Softmax
+        m_i = -float("inf")
+        l_i = 0.0
         acc = tl.zeros([head_dim], dtype=tl.float32)
-        exp_sum = 0.0
 
+        slot_offsets = tl.arange(0, BLOCK_SIZE)
+
+        # Loop over physical KV blocks
         for block_idx in range(num_blocks):
             physical_block_id = tl.load(
                 block_tables_ptr + seq_idx * stride_bt_seq + block_idx
             )
 
-            for slot in range(block_size):
-                token_pos = block_idx * block_size + slot
-                if token_pos < context_len:
-                    k_ptr = (
-                        key_cache_ptr
-                        + physical_block_id * stride_k_block
-                        + head_idx * stride_k_head
-                        + slot * stride_k_tok
-                        + dim_offsets
-                    )
-                    k = tl.load(k_ptr)
+            # Mask out invalid padding tokens in the final block
+            token_positions = block_idx * BLOCK_SIZE + slot_offsets
+            mask = token_positions < context_len
 
-                    score = tl.sum(q * k) * scale
+            # Vectorized Key Load: [BLOCK_SIZE, head_dim]
+            k_ptrs = (
+                key_cache_ptr
+                + physical_block_id * stride_k_block
+                + head_idx * stride_k_head
+                + slot_offsets[:, None] * stride_k_tok
+                + dim_offsets[None, :]
+            )
+            k = tl.load(k_ptrs, mask=mask[:, None], other=0.0)
 
-                    if score > max_score:
-                        alpha = tl.exp(max_score - score)
-                        acc = acc * alpha
-                        exp_sum = exp_sum * alpha
-                        max_score = score
+            # Compute Attention Scores for the block: q * K^T -> [BLOCK_SIZE]
+            qk = tl.sum(q[None, :] * k, axis=1) * scale
+            qk = tl.where(mask, qk, -float("inf"))
 
-                    p = tl.exp(score - max_score)
-                    exp_sum += p
+            # Online Softmax Update
+            m_ij = tl.maximum(m_i, tl.max(qk, 0))
+            p = tl.exp(qk - m_ij)
+            l_ij = tl.sum(p, 0)
 
-                    v_ptr = (
-                        value_cache_ptr
-                        + physical_block_id * stride_v_block
-                        + head_idx * stride_v_head
-                        + slot * stride_v_tok
-                        + dim_offsets
-                    )
-                    v = tl.load(v_ptr)
-                    acc += p * v
+            alpha = tl.exp(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
 
-        if exp_sum > 0:
-            out = acc / exp_sum
+            # Vectorized Value Load: [BLOCK_SIZE, head_dim]
+            v_ptrs = (
+                value_cache_ptr
+                + physical_block_id * stride_v_block
+                + head_idx * stride_v_head
+                + slot_offsets[:, None] * stride_v_tok
+                + dim_offsets[None, :]
+            )
+            v = tl.load(v_ptrs, mask=mask[:, None], other=0.0)
+
+            # Accumulate Attention-Weighted Values
+            acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+            m_i = m_ij
+
+        # Final Normalization
+        if l_i > 0:
+            acc = acc / l_i
             out_ptr_final = (
                 out_ptr + seq_idx * stride_out_seq + head_idx * stride_out_head + dim_offsets
             )
-            tl.store(out_ptr_final, out.to(out_ptr.dtype.element_ty))
+            tl.store(out_ptr_final, acc.to(out_ptr.dtype.element_ty))
 
 
 def pytorch_paged_attention_fallback(
@@ -160,17 +177,11 @@ def paged_attention_decode(
     if TRITON_AVAILABLE and query.is_cuda:
         try:
             num_seqs, num_heads, head_dim = query.shape
-            max_num_blocks_per_seq = block_tables.shape[1]
 
             out = torch.empty_like(query)
-            exp_sums = torch.empty((num_seqs, num_heads), dtype=torch.float32, device=query.device)
-            max_scores = torch.empty((num_seqs, num_heads), dtype=torch.float32, device=query.device)
-
             grid = (num_seqs, num_heads)
 
             _paged_attention_decode_kernel[grid](
-                exp_sums,
-                max_scores,
                 out,
                 query,
                 key_cache,
@@ -181,8 +192,7 @@ def paged_attention_decode(
                 num_seqs,
                 num_heads,
                 head_dim=head_dim,
-                block_size=block_size,
-                max_num_blocks_per_seq=max_num_blocks_per_seq,
+                BLOCK_SIZE=block_size,
                 stride_q_seq=query.stride(0),
                 stride_q_head=query.stride(1),
                 stride_k_block=key_cache.stride(0),
@@ -197,7 +207,7 @@ def paged_attention_decode(
             )
             return out
         except Exception:
-            # Fall back to PyTorch gather on Triton runtime mismatch
+            # Fall back to PyTorch gather on Triton runtime mismatch or execution error
             pass
 
     return pytorch_paged_attention_fallback(

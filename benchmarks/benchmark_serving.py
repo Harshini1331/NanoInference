@@ -23,7 +23,7 @@ async def send_request(session: aiohttp.ClientSession, url: str, prompt: str, ma
     try:
         async with session.post(url, json=payload) as response:
             if response.status != 200:
-                print(f"❌ Error: Status {response.status}")
+                print(f"[ERROR] Status {response.status}")
                 return None
 
             async for line in response.content:
@@ -62,7 +62,7 @@ async def send_request(session: aiohttp.ClientSession, url: str, prompt: str, ma
         }
 
     except Exception as e:
-        print(f"❌ Request failed: {e}")
+        print(f"[ERROR] Request failed: {e}")
         return None
 
 
@@ -70,11 +70,11 @@ async def run_benchmark(url: str, concurrency: int, total_requests: int, max_tok
     """Runs concurrent load test against the serving backend."""
     prompt = "Explain quantum computing in detail and why it is important for cryptography."
     
-    print(f"\n🚀 Starting Benchmark...")
-    print(f"• URL: {url}")
-    print(f"• Concurrency Level: {concurrency}")
-    print(f"• Total Requests: {total_requests}")
-    print(f"• Max Tokens per Request: {max_tokens}\n")
+    print(f"\n[BENCHMARK] Starting Benchmark...")
+    print(f"- URL: {url}")
+    print(f"- Concurrency Level: {concurrency}")
+    print(f"- Total Requests: {total_requests}")
+    print(f"- Max Tokens per Request: {max_tokens}\n")
 
     semaphore = asyncio.Semaphore(concurrency)
 
@@ -92,7 +92,7 @@ async def run_benchmark(url: str, concurrency: int, total_requests: int, max_tok
     valid_results = [r for r in results if r is not None]
 
     if not valid_results:
-        print("❌ All requests failed.")
+        print("[ERROR] All requests failed.")
         return
 
     # Aggregate Statistics
@@ -102,7 +102,7 @@ async def run_benchmark(url: str, concurrency: int, total_requests: int, max_tok
     system_throughput = total_tokens / total_benchmark_time
 
     print("=" * 50)
-    print("📊 NANOINFERENCE BENCHMARK RESULTS")
+    print("[BENCHMARK] NANOINFERENCE BENCHMARK RESULTS")
     print("=" * 50)
     print(f" Successful Requests : {len(valid_results)} / {total_requests}")
     print(f" Total Execution Time: {total_benchmark_time:.2f} s")
